@@ -100,8 +100,6 @@ Password: the POSTGRES_PASSWORD value from your .env file
 
 ```text
 DESystemDesign/
-|-- .env.example
-|-- .gitignore
 |-- docker-compose.yml
 |-- Dockerfile
 |-- requirements.txt
