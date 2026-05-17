@@ -3,14 +3,19 @@ services:
     image: postgres:18-alpine
     container_name: market_postgres
     environment:
+      # These initialize the PostgreSQL database when the volume is first created.
       POSTGRES_DB: testDB
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
+      # Host port 5433 maps to container port 5432 to avoid conflicts with local Postgres.
       - "5433:5432"
     volumes:
+      # This named volume keeps database data between container restarts.
+      # docker compose down -v deletes it and resets the database.
       - postgres_data:/var/lib/postgresql
     healthcheck:
+      # The ETL waits until Postgres is ready before trying to connect.
       test: ["CMD-SHELL", "pg_isready -U postgres -d testDB"]
       interval: 5s
       timeout: 5s
@@ -22,8 +27,10 @@ services:
     container_name: market_etl
     depends_on:
       postgres:
+        # Prevents the Python script from starting before the database is healthy.
         condition: service_healthy
     environment:
+      # Runtime settings are passed into main.py through os.environ.
       API_KEY: ${API_KEY}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_HOST: postgres

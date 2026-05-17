@@ -5,13 +5,19 @@ from psycopg.types.json import Jsonb
 
 logger = logging.getLogger(__name__)
 
+
 def create_warehouse_objects(cur):
+    """Create the Bronze, Silver, and Gold database objects."""
+
     logger.info("Creating warehouse schemas and tables")
 
+    # Schemas separate raw, cleaned, and analytics-ready data.
     cur.execute("CREATE SCHEMA IF NOT EXISTS bronze")
     cur.execute("CREATE SCHEMA IF NOT EXISTS silver")
     cur.execute("CREATE SCHEMA IF NOT EXISTS gold")
 
+    # Bronze stores the complete API response exactly as received.
+    # One row is inserted for each pipeline run, so this table is an audit log.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS bronze.alpha_vantage_responses (
             ingestion_id UUID PRIMARY KEY,
@@ -24,6 +30,8 @@ def create_warehouse_objects(cur):
         )
     """)
 
+    # Silver stores one clean row per symbol and trading day.
+    # The primary key prevents duplicate price rows for the same symbol/date.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS silver.stock_daily_prices (
             symbol TEXT NOT NULL,
@@ -38,6 +46,9 @@ def create_warehouse_objects(cur):
             PRIMARY KEY (symbol, trade_date)
         )
     """)
+
+    # Gold stores derived metrics used for reporting and analysis.
+    # It repeats key price fields so reports can read from one analytics table.
     cur.execute("""
             CREATE TABLE IF NOT EXISTS gold.stock_daily_analytics (
                 symbol TEXT NOT NULL,
@@ -60,8 +71,12 @@ def create_warehouse_objects(cur):
 
 
 def load_bronze(cur, symbol, request_params, response_payload):
+    """Insert one raw API response into the Bronze layer."""
+
     logger.info("Loading raw API response into Bronze layer")
 
+    # The ingestion ID connects raw data to downstream Silver/Gold rows.
+    # uuid4 creates a unique batch ID without needing a database sequence.
     ingestion_id = uuid.uuid4()
 
     cur.execute("""
@@ -79,6 +94,7 @@ def load_bronze(cur, symbol, request_params, response_payload):
         "Alpha Vantage",
         request_params["function"],
         symbol,
+        # Jsonb tells psycopg to store Python dictionaries as PostgreSQL JSONB.
         Jsonb(request_params),
         Jsonb(response_payload),
     ))
@@ -87,11 +103,15 @@ def load_bronze(cur, symbol, request_params, response_payload):
 
 
 def load_silver(cur, symbol, ingestion_id, response_payload):
+    """Transform Alpha Vantage daily JSON into clean Silver price rows."""
+
     logger.info("Transforming raw market data into Silver layer")
 
     time_series = response_payload["Time Series (Daily)"]
 
     for trade_date, values in time_series.items():
+        # Alpha Vantage uses numbered JSON keys, so values are mapped explicitly.
+        # Decimal keeps price values exact enough for financial calculations.
         cur.execute("""
             INSERT INTO silver.stock_daily_prices (
                 symbol,
@@ -106,6 +126,8 @@ def load_silver(cur, symbol, ingestion_id, response_payload):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (symbol, trade_date)
             DO UPDATE SET
+                -- Re-running the pipeline refreshes existing dates instead of duplicating rows.
+                -- It does not delete older dates already stored in Silver.
                 open_price = EXCLUDED.open_price,
                 high_price = EXCLUDED.high_price,
                 low_price = EXCLUDED.low_price,
@@ -129,8 +151,11 @@ def load_silver(cur, symbol, ingestion_id, response_payload):
 
 
 def run_data_quality_checks(cur, symbol):
+    """Validate that Silver contains usable records for the requested symbol."""
+
     logger.info("Running data quality checks for symbol: %s", symbol)
 
+    # The pipeline should never continue if no cleaned rows were loaded.
     cur.execute("""
         SELECT COUNT(*)
         FROM silver.stock_daily_prices
@@ -142,6 +167,7 @@ def run_data_quality_checks(cur, symbol):
     if row_count == 0:
         raise RuntimeError("Data quality check failed: no Silver records were loaded.")
 
+    # Required fields must be present, and volume cannot be negative.
     cur.execute("""
         SELECT COUNT(*)
         FROM silver.stock_daily_prices
@@ -166,6 +192,8 @@ def run_data_quality_checks(cur, symbol):
 
 
 def load_gold_analytics(cur, symbol):
+    """Build analytics metrics from Silver price history."""
+
     cur.execute("""
         INSERT INTO gold.stock_daily_analytics (
             symbol,
@@ -191,16 +219,20 @@ def load_gold_analytics(cur, symbol):
             close_price,
             volume,
             previous_close_price,
+            -- Difference between today's close and the previous trading day's close.
             close_price - previous_close_price AS daily_price_change,
             CASE
+                -- Avoid divide-by-zero and avoid calculating return for the first row.
                 WHEN previous_close_price IS NULL OR previous_close_price = 0 THEN NULL
                 ELSE ROUND(((close_price - previous_close_price) / previous_close_price) * 100, 4)
             END AS daily_return_pct,
             CASE
+                -- Simple intraday volatility estimate based on high/low range.
                 WHEN close_price = 0 THEN NULL
                 ELSE ROUND(((high_price - low_price) / close_price) * 100, 4)
             END AS daily_volatility,
             CASE
+                -- Converts the price comparison into a readable reporting label.
                 WHEN previous_close_price IS NULL THEN 'UNKNOWN'
                 WHEN close_price > previous_close_price THEN 'UP'
                 WHEN close_price < previous_close_price THEN 'DOWN'
@@ -217,6 +249,7 @@ def load_gold_analytics(cur, symbol):
                 close_price,
                 volume,
                 ingestion_id,
+                -- LAG gives each row access to the previous trading day's close price.
                 LAG(close_price) OVER (
                     PARTITION BY symbol
                     ORDER BY trade_date
@@ -226,6 +259,7 @@ def load_gold_analytics(cur, symbol):
         ) prices_with_history
         ON CONFLICT (symbol, trade_date)
         DO UPDATE SET
+            -- Gold is also rerunnable: existing analytics rows are recalculated.
             open_price = EXCLUDED.open_price,
             high_price = EXCLUDED.high_price,
             low_price = EXCLUDED.low_price,
