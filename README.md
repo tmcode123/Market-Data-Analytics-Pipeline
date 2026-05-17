@@ -161,7 +161,7 @@ SQL Analysis / pgAdmin
 3. The raw response is transformed into clean daily stock price records in the Silver schema.
 4. Data quality checks validate that records were loaded correctly.
 5. The Gold schema calculates analytics-ready metrics for reporting.
-6. The final data can be queried in pgAdmin or any PostgreSQL SQL client.
+6. The final data can be queried in pgAdmin.
 
 ## Medallion Architecture
 
